@@ -1,18 +1,21 @@
 import pandas as pd
 import numpy as np
 import pyodbc
-import time
+import datetime
 import logging
-from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
+import time
 import schedule
-import threading
-from sqlalchemy import create_engine, text, Table, Column, Integer, String, Float, DateTime, MetaData
-from sqlalchemy.dialects.mssql import DECIMAL
+from sqlalchemy import create_engine, text
+from typing import Dict, List, Tuple, Optional, Any
+from abc import ABC, abstractmethod
 import os
 from dotenv import load_dotenv
-
+import math
+# Load environment variables from .env file
 load_dotenv()
 
+# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -21,502 +24,681 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
-logger = logging.getLogger("SectorIndexCalculator")
+logger = logging.getLogger("sector_index")
 
-class SectorIndexCalculator:
-    def __init__(self, base_timestamp=None, base_index_value=100):
-        """
-        Initialize the Sector Index Calculator
-        
-        Parameters:
-        base_timestamp: The starting timestamp for index calculation (default: None, will use first available)
-        base_index_value: The initial index value (default: 100)
-        """
-        self.db_server = os.getenv('DB_SERVER')
-        self.db_name = os.getenv('DB_NAME')
-        self.db_username = os.getenv('DB_USERNAME')
-        self.db_password = os.getenv('DB_PASSWORD')
-        self.freq = os.getenv('freq')
-        
-        self.conn_str = f"Driver={{SQL Server}};Server={self.db_server};Database={self.db_name};UID={self.db_username};PWD={self.db_password}"
-        
-
-        self.engine = create_engine(f"mssql+pyodbc:///?odbc_connect={self.conn_str}")
-        
-        self.base_timestamp = base_timestamp
-        self.base_index_value = base_index_value
-        self.sector_indices = {}  # Store the latest index values for each sector
-        self.last_processed_time = None
-        
-        # Create sector_indices table if it doesn't exist
-        self._create_sector_indices_table()
-        
-        logger.info(f"Connected to database: {self.db_name} on server: {self.db_server}")
+class DatabaseConnector:
+    """Class for managing database connections and operations"""
     
-    def _create_sector_indices_table(self):
-        """Create the sector_indices table if it doesn't exist"""
+    def __init__(self, config: Dict[str, str]):
+        self.config = config
+        self._engine = None
+        self._max_connection_attempts = 3
+        self._connection_retry_delay = 5  # seconds
+    
+    @property
+    def engine(self):
+        """Lazy initialization of database engine"""
+        if self._engine is None:
+            conn_str = self._get_connection_string()
+            connection_url = f"mssql+pyodbc:///?odbc_connect={conn_str}"
+            self._engine = create_engine(
+                connection_url, 
+                pool_recycle=1800,  # Recycle connections after 30 minutes
+                pool_pre_ping=True,  # Check connections before use
+                pool_size=5,  # Limit pool size
+                max_overflow=10,  # Maximum number of overflow connections
+                connect_args={"timeout": 30}  # Connection timeout in seconds
+            )
+        return self._engine
+    
+    def _get_connection_string(self) -> str:
+        """Create connection string from config"""
+        if self.config.get('use_windows_auth', False):
+            return f"DRIVER={self.config['driver']};SERVER={self.config['server']};DATABASE={self.config['database']};Trusted_Connection=yes"
+        else:
+            return f"DRIVER={self.config['driver']};SERVER={self.config['server']};DATABASE={self.config['database']};UID={self.config['username']};PWD={self.config['password']}"
+    
+    def verify_connection(self) -> bool:
+        """Verify database connection is working"""
         try:
-            create_table_query = """
-            IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'[dbo].[sector_indices]') AND type in (N'U'))
-            BEGIN
-                CREATE TABLE [dbo].[sector_indices](
-                    [id] [int] IDENTITY(1,1) PRIMARY KEY,
-                    [sector_code] [varchar](50) NOT NULL,
-                    [sector_name] [varchar](100) NOT NULL,
-                    [index_value] [decimal](18, 4) NOT NULL,
-                    [sector_return] [decimal](18, 4) NULL,
-                    [calculation_timestamp] [datetime] NOT NULL,
-                    [created_at] [datetime] NOT NULL DEFAULT GETDATE()
+            with self.engine.connect() as conn:
+                conn.execute(text("SELECT 1")).fetchone()
+                return True
+        except Exception as e:
+            logger.error(f"Database connection error: {str(e)}")
+            return False
+    
+    def execute_query(self, query: str) -> Any:
+        """Execute a query and return the result with retry logic"""
+        for attempt in range(self._max_connection_attempts):
+            try:
+                with self.engine.connect() as conn:
+                    result = conn.execute(text(query))
+                    if result.returns_rows:
+                        # Fetch all results to detach from connection
+                        rows = result.fetchall()
+                        return rows
+                    return result
+            except Exception as e:
+                if attempt < self._max_connection_attempts - 1:
+                    logger.warning(f"Query failed (attempt {attempt+1}), retrying: {str(e)}")
+                    time.sleep(self._connection_retry_delay)
+                else:
+                    logger.error(f"Query failed after {self._max_connection_attempts} attempts: {str(e)}")
+                    raise
+    
+    def fetch_dataframe(self, query: str) -> pd.DataFrame:
+        """Execute a query and return the result as a DataFrame with retry logic"""
+        for attempt in range(self._max_connection_attempts):
+            try:
+                with self.engine.connect() as conn:
+                    return pd.read_sql(text(query), conn)
+            except Exception as e:
+                if attempt < self._max_connection_attempts - 1:
+                    logger.warning(f"DataFrame query failed (attempt {attempt+1}), retrying: {str(e)}")
+                    time.sleep(self._connection_retry_delay)
+                else:
+                    logger.error(f"DataFrame query failed after {self._max_connection_attempts} attempts: {str(e)}")
+                    # Return empty dataframe on failure
+                    return pd.DataFrame()
+    
+    def execute_transaction(self, queries: List[str]) -> bool:
+        """Execute multiple queries in a transaction with proper error handling"""
+        try:
+            with self.engine.begin() as conn:
+                for query in queries:
+                    conn.execute(text(query))
+            return True
+        except Exception as e:
+            logger.error(f"Transaction failed: {str(e)}")
+            return False
+
+class IndexCalculator:
+    """Base abstract class for index calculators"""
+    
+    def __init__(self, db_connector: DatabaseConnector):
+        self.db = db_connector
+    
+    @abstractmethod
+    def calculate(self) -> pd.DataFrame:
+        """Calculate the index values"""
+        pass
+    
+    @abstractmethod
+    def store_results(self, results: pd.DataFrame) -> None:
+        """Store calculated results"""
+        pass
+
+
+class SectorIndexCalculator(IndexCalculator):
+    """Class for calculating sector-based indices"""
+    
+    def __init__(self, db_connector: DatabaseConnector):
+        super().__init__(db_connector)
+        self.current_indices = {} 
+        self.prev_market_cap_data = None 
+        self._sector_cache = None  
+        self._sector_cache_timestamp = None  
+        self._sector_cache_ttl = 3600  # Cache TTL in seconds (1 hour)
+        self._indices_initialized = False  # Flag to track if indices have been initialized  # Cache TTL in seconds (1 hour)
+    
+    def initialize_indices(self) -> None:
+        """Initialize index values from daily_index table using a stored procedure"""
+        if self._indices_initialized:
+            logger.debug("Indices already initialized")
+            return
+
+        try:
+            logger.info("Initializing sector indices using stored procedure")
+
+            query = "EXEC sector_index.GetLatestSectorIndices"
+            indices_df = self.db.fetch_dataframe(query)
+
+            if not indices_df.empty:
+                for _, row in indices_df.iterrows():
+                    sector_code = row['sector_code']
+                    index_value = float(row['end_index_value'])
+                    self.current_indices[sector_code] = index_value
+                    logger.info(f"Initialized {sector_code} index with value {index_value:.2f}")
+
+                logger.info(f"Initialized {len(indices_df)} sector indices from stored procedure")
+            else:
+                logger.warning("No previous index data found, using default values")
+                for sector_code, _ in self.sector_cache().items():
+                    self.current_indices[sector_code] = 100.0
+                    logger.info(f"Initialized {sector_code} index with default value 100.0")
+
+            self._indices_initialized = True
+        except Exception as e:
+            logger.error(f"Error initializing indices with stored procedure: {str(e)}")
+            for sector_code, _ in self.sector_cache().items():
+                self.current_indices[sector_code] = 100.0
+            self._indices_initialized = True
+
+
+
+    def sector_cache(self) -> Dict[str, Dict[str, Any]]:
+        """Fetch sector information from the database with caching"""
+        current_time = time.time()
+        
+        # Return cached data if valid
+        if (self._sector_cache is not None and 
+            self._sector_cache_timestamp is not None and 
+            current_time - self._sector_cache_timestamp < self._sector_cache_ttl):
+            logger.debug("Using cached sector information")
+            return self._sector_cache
+        
+        try:
+            logger.info("Loading sector information from database")
+    
+            # Get active sectors
+            sectors_df = self.db.fetch_dataframe(
+                "SELECT sector_code, sector_name FROM Sector_Information WHERE isActive = 1"
+            )
+            
+            # Get sector-symbol mappings
+            sector_symbol_df = self.db.fetch_dataframe(
+                "SELECT sector_code, company FROM Sector_Symbol"
+            )
+            
+            # Create a dictionary of sectors with their symbols
+            data = {}
+            for sector_code in sectors_df['sector_code'].unique():
+                sector_name = sectors_df[sectors_df['sector_code'] == sector_code]['sector_name'].iloc[0]
+                symbols = sector_symbol_df[sector_symbol_df['sector_code'] == sector_code]['company'].tolist()
+                data[sector_code] = {
+                    'name': sector_name,
+                    'symbols': symbols,
+                    'last_index_value': 100.0  # Initialize with base value of 100
+                }
+            
+            # Update cache and timestamp
+            self._sector_cache = data
+            self._sector_cache_timestamp = current_time
+            
+            return data
+        except Exception as e:
+            logger.error(f"Error fetching sector cache: {str(e)}")
+            # Return existing cache if available (even if expired) or empty dict
+            return self._sector_cache if self._sector_cache is not None else {}
+    
+    def get_market_cap_data(self, timestamp: datetime.datetime) -> Dict[str, Dict[str, Any]]:
+        """Calculate market cap data for all companies at a specific timestamp"""
+        try:
+            timestamp_str = timestamp
+            query = f"EXEC sector_index.sp_GetMarketCapData @timestamp = '{timestamp_str}'"
+            current_market_data_df = self.db.fetch_dataframe(query)
+            
+            current_market_data = {}
+            
+            for _, row in current_market_data_df.iterrows():
+                company = row['company']
+                ltp = row['LTP']
+                ltp_dt = row['ltp_dt']
+                current_market_data[company] = {
+                    'ltp': ltp,
+                    'timestamp': timestamp,
+                    'total_shares': 0,
+                    'market_cap': 0,
+                    'free_float_pct': 0,
+                    'free_float_mcap': 0,                  
+                }
+            return current_market_data
+        except Exception as e:
+            logger.error(f"Error calculating market cap data: {str(e)}")
+            return {}
+    
+    def get_previous_market_cap_data(self) -> Dict[str, Dict[str, Any]]:
+        """Get market cap data using stored procedure"""
+        try:
+            if self.prev_market_cap_data is None:
+                logger.info("Fetching previous market cap data using stored procedure")
+
+                # Call the stored procedure
+                query = "EXEC sector_index.get_previous_market_cap_data"
+                prev_data_df = self.db.fetch_dataframe(query)
+
+                self.prev_market_cap_data = {}
+                for _, row in prev_data_df.iterrows():
+                    company = row['company']
+                    self.prev_market_cap_data[company] = {
+                        'ltp': row['ltp'],
+                        'timestamp': row['timestamp'],
+                        'total_shares': row['total_shares'],
+                        'market_cap': row['market_cap'],
+                        'free_float_pct': row['free_float_pct'],
+                        'free_float_mcap': row['free_float_mcap']
+                    }
+
+                logger.info(f"Loaded previous market cap data for {len(self.prev_market_cap_data)} companies")
+            else:
+                logger.debug("Using cached previous market cap data")
+
+            return self.prev_market_cap_data
+
+        except Exception as e:
+            logger.error(f"Error getting previous market cap data: {str(e)}")
+            return {}
+    
+    def save_previous_market_cap_data(self) -> bool:
+        """Save the current market cap data to database for use in next trading session"""
+        if not self.prev_market_cap_data:
+            logger.warning("No market cap data to save")
+            return False
+
+        try:
+            logger.info("Saving market cap data for next trading day")
+
+            # Start building queries with TRUNCATE first
+            queries = ["TRUNCATE TABLE previous_market_cap_data"]
+
+            for company, data in self.prev_market_cap_data.items():
+                # Sanitize company name
+                sanitized_company = company.replace("'", "''")
+
+                # Format timestamp
+                if isinstance(data['timestamp'], datetime.datetime):
+                    timestamp_str = data['timestamp'].strftime('%Y-%m-%d %H:%M:%S')
+                else:
+                    timestamp_str = str(data['timestamp'])
+
+                # Handle NaN values - replace with NULL for SQL
+                ltp = data['ltp'] if not pd.isna(data['ltp']) else 'NULL'
+                total_shares = data['total_shares'] if not pd.isna(data['total_shares']) else 'NULL'
+                market_cap = data['market_cap'] if not pd.isna(data['market_cap']) else 'NULL'
+                free_float_pct = data['free_float_pct'] if not pd.isna(data['free_float_pct']) else 'NULL'
+                free_float_mcap = data['free_float_mcap'] if not pd.isna(data['free_float_mcap']) else 'NULL'
+
+                values_part = f"'{sanitized_company}', "
+                values_part += f"{ltp}, "
+                values_part += f"'{timestamp_str}', "
+                values_part += f"{total_shares}, "
+                values_part += f"{market_cap}, "
+                values_part += f"{free_float_pct}, "
+                values_part += f"{free_float_mcap}"
+
+                insert_query = f"""
+                INSERT INTO previous_market_cap_data (
+                    company, 
+                    ltp, 
+                    timestamp, 
+                    total_shares, 
+                    market_cap, 
+                    free_float_pct, 
+                    free_float_mcap
                 )
-            END
-            """
-            with self.engine.connect() as connection:
-                connection.execute(text(create_table_query))
-                connection.commit()
-                
-            logger.info("Sector indices table created or confirmed existing")
+                VALUES ({values_part})
+                """
+                queries.append(insert_query)
+
+            # Execute TRUNCATE + all INSERTs as one transaction
+            success = self.db.execute_transaction(queries)
+
+            if success:
+                logger.info(f"Stored market cap data for {len(self.prev_market_cap_data)} companies")
+            else:
+                logger.error("Failed to store market cap data")
+
+            return success
         except Exception as e:
-            logger.error(f"Error creating sector indices table: {str(e)}")
+            logger.exception(f"Error saving market cap data: {str(e)}")
+            return False
     
-    def get_latest_data(self):
-        """Get the latest price data and sector/company info from the database"""
+    def calculate(self) -> pd.DataFrame:
+        """Calculate sector indices based on the latest LTP data"""
         try:
-            price_data_query = """
-                SELECT 
-                    company AS symbol, 
-                    LTP AS ltp, 
-                    ltp_dt AS timestamp
-                FROM Symbol_LTP 
-                WHERE ltp_dt > ISNULL(?, '1900-01-01')
-                ORDER BY ltp_dt ASC
-            """
-                                    
-            company_info_query = """
-                SELECT 
-                    ss.company AS symbol,
-                    si.sector_code,
-                    si.sector_name,
-                    sh.total_share AS shares_outstanding,
-                    sh.Sponsor / 100.0 AS sponsor_shareholding_pct,
-                    sh.Govt / 100.0 AS govt_shareholding_pct
-                FROM Sector_Symbol ss
-                JOIN Sector_Information si ON ss.sector_code = si.sector_code
-                JOIN Symbol_Share sh ON ss.company = sh.company
-                WHERE si.isActive = 1
-            """
-            
-            with pyodbc.connect(self.conn_str) as conn:
-                cursor = conn.cursor()
+            # Initialize indices if not already done
+            if not self._indices_initialized:
+                self.initialize_indices()
                 
-                cursor.execute(price_data_query, (self.last_processed_time,))
-                price_data = cursor.fetchall()
-                
-                cursor.execute(company_info_query)
-                company_info_data = cursor.fetchall()
-        
-            symbols = []
-            ltps = []
-            timestamps = []
+            # Verify DB connection before proceeding
+            if not self.db.verify_connection():
+                logger.error("Database connection failed during calculation")
+                return pd.DataFrame()
             
-            for row in price_data:
-                symbols.append(row[0])      
-                ltps.append(row[1])         
-                timestamps.append(row[2])   
+            current_timestamp = datetime.datetime.now().replace(microsecond=0)
+            current_timestamp = current_timestamp.strftime('%Y-%m-%d %H:%M:%S')
             
-            price_df = pd.DataFrame({
-                'symbol': symbols,
-                'ltp': ltps,
-                'timestamp': timestamps
-            })
+            # Get market cap data for current timestamp
+            current_mcap_data = self.get_market_cap_data(current_timestamp)
             
-            company_symbols = []
-            sector_codes = []
-            sector_names = []
-            shares_outstandings = []
-            sponsor_shareholding_pcts = []
-            govt_shareholding_pcts = []
+            # Ensure previous market cap data is loaded
+            if self.prev_market_cap_data is None:
+                self.get_previous_market_cap_data()
             
-            for row in company_info_data:
-                company_symbols.append(row[0])      
-                sector_codes.append(row[1])           
-                sector_names.append(row[2])             
-                shares_outstandings.append(row[3])     
-                sponsor_shareholding_pcts.append(row[4]) 
-                govt_shareholding_pcts.append(row[5])   
+            if not current_mcap_data or not self.prev_market_cap_data:
+                logger.warning("Insufficient market cap data for index calculation")
+                return pd.DataFrame()
             
-            company_info_df = pd.DataFrame({
-                'symbol': company_symbols,
-                'sector_code': sector_codes,
-                'sector_name': sector_names,
-                'shares_outstanding': shares_outstandings,
-                'sponsor_shareholding_pct': sponsor_shareholding_pcts,
-                'govt_shareholding_pct': govt_shareholding_pcts
-            })
-            
-           
-            price_df = price_df.dropna(subset=['ltp'])
-            
-            if not price_df.empty:
-                self.last_processed_time = price_df['timestamp'].max()
-            
-            return price_df, company_info_df
-            
-        except Exception as e:
-            logger.error(f"Error getting data from database: {str(e)}")
-            return pd.DataFrame(), pd.DataFrame()
+            # Update current market data with previous data where needed
+            for company, prev_data in self.prev_market_cap_data.items():
+                if company not in current_mcap_data:
+                    current_mcap_data[company] = prev_data
+                else:
+                    current_mcap_data[company]['free_float_pct'] = prev_data['free_float_pct']
+                    current_mcap_data[company]['total_shares'] = prev_data['total_shares']
+                    current_mcap_data[company]['market_cap'] = current_mcap_data[company]['ltp'] * current_mcap_data[company]['total_shares']
+                    current_mcap_data[company]['free_float_mcap'] = (current_mcap_data[company]['market_cap'] * current_mcap_data[company]['free_float_pct']) / 100
 
-    def prepare_complete_price_data(self, price_df, company_info_df):
-        """
-        Ensure we have price data for all 656 companies at each timestamp interval.
-        For each 10s interval, include the latest price for each company.
-        """
-        try:
-
-            price_df['timestamp'] = pd.to_datetime(price_df['timestamp'])
-            
-
-            price_df = price_df.sort_values(['symbol', 'timestamp'])
-            
-            
-            min_time = price_df['timestamp'].min()
-            max_time = price_df['timestamp'].max()
-            
-            time_range = pd.date_range(start=min_time, end=max_time, freq=self.freq)
-            
-
-            results = []
-            
-            
-            for ts in time_range:
-                temp_df = price_df[price_df['timestamp'] <= ts]
-                
-                # Group by symbol and get the latest entry for each
-                latest_prices = temp_df.groupby('symbol').last().reset_index()
-                
-                # Add the timestamp column to identify this interval
-                # Remove the original timestamp column first to avoid duplication
-                latest_prices = latest_prices.drop('timestamp', axis=1)  # Drop the original timestamp
-                latest_prices['timestamp'] = ts  
-                
-                results.append(latest_prices)
-            
-            merged_df = pd.concat(results, ignore_index=True)
-            
-            # Create a complete DataFrame with all symbol-timestamp combinations
-            all_symbols = company_info_df['symbol'].unique()
-            all_intervals = list(time_range)
-            
-            complete_index = pd.MultiIndex.from_product([all_symbols, all_intervals], names=['symbol', 'timestamp'])
-            complete_df = pd.DataFrame(index=complete_index).reset_index()
-            
-            # Merge with our results to fill in available data
-            final_complete_df = pd.merge(complete_df, merged_df, on=['symbol', 'timestamp'], how='left')
-            
-            # For rows where price is missing, forward fill from previous timestamps
-            final_complete_df = final_complete_df.sort_values(['symbol', 'timestamp'])
-            final_complete_df['ltp'] = final_complete_df.groupby('symbol')['ltp'].ffill()
-            
-            logger.info(f"Prepared complete price data with {len(final_complete_df)} rows")
-            # final_complete_df.to_csv("final_complete_df.csv", index=False)
-            return final_complete_df
-        
-        except Exception as e:
-            logger.error(f"Error in prepare_complete_price_data: {str(e)}")
-            return price_df  # Return original if error
-            
-        
-    
-    def calculate_market_cap(self, df):
-        """
-        Step 1: Calculate market capitalization for each company
-        Market Cap = LTP * number of shares
-        """
-        df['market_cap'] = df['ltp'] * df['shares_outstanding']
-        return df
-    
-    def calculate_free_float(self, df):
-        """
-        Step 2: Calculate free float percentage
-        Free Float (%) = 1 - (Sponsor Shareholding (%) + Govt. Shareholding (%))
-        """
-        df['free_float_pct'] = 1 - (df['sponsor_shareholding_pct'] + df['govt_shareholding_pct'])
-        return df
-    
-    def calculate_free_float_mcap(self, df):
-        """
-        Step 3: Calculate free float market capitalization
-        Free Float Market Cap = Free Float (%) * Market Cap
-        """
-        df['free_float_mcap'] = df['free_float_pct'] * df['market_cap']
-        return df
-    
-    def calculate_sector_weights(self, df):
-        """
-        Step 4: Calculate free float market cap weight for each company within its sector
-        Company FF Mcap Weight (%) = (Company FF Mcap / Total Sectoral FF Mcap) * 100
-        """
-        # Calculate total FF Mcap for each sector
-        sector_totals = df.groupby('sector_code')['free_float_mcap'].sum().reset_index()
-        sector_totals.rename(columns={'free_float_mcap': 'total_sector_ff_mcap'}, inplace=True)
-        
-        # Merge back to get the sector totals
-        df = pd.merge(df, sector_totals, on='sector_code', how='left')
-        
-        # Calculate the weight
-        # Ensure we're working with float values instead of Decimal to avoid DivisionUndefined error
-        df['free_float_mcap'] = df['free_float_mcap'].astype(float)
-        df['total_sector_ff_mcap'] = df['total_sector_ff_mcap'].astype(float)
-        
-        # Use numpy's where to handle division by zero
-        df['ff_mcap_weight'] = np.where(
-            df['total_sector_ff_mcap'] > 0,  # Check only if denominator is > 0
-            (df['free_float_mcap'] / df['total_sector_ff_mcap']) * 100,
-            0  # Default to 0 if denominator is 0
-        )
-        
-        return df
-    
-    def process_timestamp_data(self, current_data, previous_data=None):
-        """
-        Process data for the current timestamp, calculating steps 5-8
-        
-        Parameters:
-        current_data: DataFrame containing current timestamp data with all calculations up to step 4
-        previous_data: DataFrame containing previous timestamp data with all calculations (default: None)
-        
-        Returns:
-        DataFrame with sector indices for the current timestamp
-        """
-        if previous_data is None and self.base_timestamp is None:
-            # First run, set base timestamp and return initial index values
-            sectors = current_data[['sector_code', 'sector_name']].drop_duplicates()
-            current_timestamp = current_data['timestamp'].iloc[0]
-            
-            result_data = []
-            for _, sector in sectors.iterrows():
-                # Store the initial index values
-                self.sector_indices[sector['sector_code']] = self.base_index_value
-                
-                # Add to results
-                result_data.append({
-                    'sector_code': sector['sector_code'],
-                    'sector_name': sector['sector_name'],
-                    'index_value': float(self.base_index_value),  # Ensure it's a float
-                    'sector_return': 0.0,  # No return for base timestamp
-                    'calculation_timestamp': current_timestamp
-                })
-            
-            return pd.DataFrame(result_data)
-        
-        # Group data by sector to process each sector
-        sectors = current_data[['sector_code', 'sector_name']].drop_duplicates()
-        result_data = []
-        current_timestamp = current_data['timestamp'].iloc[0]
-        
-        for _, sector in sectors.iterrows():
-            sector_code = sector['sector_code']
-            sector_name = sector['sector_name']
-            
-            # Get data for current sector
-            sector_current = current_data[current_data['sector_code'] == sector_code]
-            
-            if previous_data is not None:
-                sector_previous = previous_data[previous_data['sector_code'] == sector_code]
-                
-                if not sector_previous.empty:
-                    # Step 5 & 6: Calculate price returns and weighted price returns
-                    merged_data = pd.merge(
-                        sector_current[['symbol', 'free_float_mcap', 'ff_mcap_weight']],
-                        sector_previous[['symbol', 'free_float_mcap']],
-                        on='symbol',
-                        how='inner',
-                        suffixes=('_current', '_previous')
-                    )
+            # Calculate indices for each sector
+            sector_results = []
+            logger.info("Calculating sector indices")
+            for sector_code, sector_info in self.sector_cache().items():
+                try:
+                    sector_symbols = sector_info['symbols']
                     
-                    # Skip if we don't have matching data
-                    if merged_data.empty:
+                    # Filter to only include companies in this sector with data available
+                    sector_symbols_with_data = [
+                        symbol for symbol in sector_symbols 
+                        if symbol in current_mcap_data and symbol in self.prev_market_cap_data
+                    ]
+                    
+                    if not sector_symbols_with_data:
+                        logger.warning(f"No data available for companies in sector {sector_code}")
                         continue
                     
-                    # Convert to float to avoid Decimal type errors
-                    merged_data['free_float_mcap_current'] = merged_data['free_float_mcap_current'].astype(float)
-                    merged_data['free_float_mcap_previous'] = merged_data['free_float_mcap_previous'].astype(float)
-                    merged_data['ff_mcap_weight'] = merged_data['ff_mcap_weight'].astype(float)
-                    
-                    # Calculate price returns with proper zero handling
-                    merged_data['price_return'] = np.where(
-                        merged_data['free_float_mcap_previous'] > 0,
-                        (merged_data['free_float_mcap_current'] / merged_data['free_float_mcap_previous']) - 1,
-                        0  # If previous free float mcap is 0, set return to 0
+                    total_sector_ff_mcap = sum(
+                        float(current_mcap_data[symbol]['free_float_mcap']) 
+                        for symbol in sector_symbols_with_data 
+                        if isinstance(current_mcap_data[symbol]['free_float_mcap'], (int, float))
                     )
                     
-                    # Calculate weighted price returns - fix the condition logic
-                    merged_data['weighted_price_return'] = np.where(
-                        (merged_data['price_return'] > 0) & (merged_data['ff_mcap_weight'] > 0),
-                        merged_data['price_return'] * (merged_data['ff_mcap_weight'] / 100),
-                        0
-                    )
+                    # Calculate company returns and weights
+                    company_returns = []
                     
-                    # Step 7: Calculate total sectoral return
-                    total_sector_return = merged_data['weighted_price_return'].sum()
+                    for company in sector_symbols_with_data:
+                        curr_data = current_mcap_data[company]
+                        prev_data = self.prev_market_cap_data[company]
+                        
+                        # Calculate company weight
+                        weight = ((curr_data['free_float_mcap'] / total_sector_ff_mcap) * 100) if total_sector_ff_mcap > 0 else 0
+                        
+                        # Calculate price return
+                        price_return = ((curr_data['free_float_mcap'] / prev_data['free_float_mcap']) - 1) if prev_data['free_float_mcap'] > 0 else 0
+                        
+                        # Calculate weighted return
+                        weighted_return = price_return * (weight / 100)
+                        
+                        company_returns.append({
+                            'company': company,
+                            'price_return': price_return,
+                            'weight': weight,
+                            'weighted_return': weighted_return
+                        })
                     
-                    # Step 8: Calculate index value
-                    previous_index = self.sector_indices.get(sector_code, self.base_index_value)
+                    # Update previous market cap data for next calculation
+                    for company in sector_symbols_with_data:
+                        curr_data = current_mcap_data[company]
+                        self.prev_market_cap_data[company] = {
+                            'ltp': curr_data['ltp'],
+                            'timestamp': current_timestamp,
+                            'total_shares': curr_data['total_shares'],
+                            'market_cap': curr_data['market_cap'],
+                            'free_float_pct': curr_data['free_float_pct'],
+                            'free_float_mcap': curr_data['free_float_mcap']
+                        }
+                    
+                    company_returns_df = pd.DataFrame(company_returns)
+                    total_sector_return = company_returns_df['weighted_return'].sum() if not company_returns_df.empty else 0
+                    logger.info(f"Total sector return for {sector_code}: {total_sector_return}")
+                    
+                    # Get previous index value from cache, fallback to 100.0 if not found
+                    previous_index = self.current_indices.get(sector_code, 100.0)
                     current_index = previous_index * (1 + total_sector_return)
                     
-                    # Store the updated index value
-                    self.sector_indices[sector_code] = current_index
+                    # Update current index value in cache
+                    self.current_indices[sector_code] = current_index
                     
-                    # Add to results - ensure types are explicitly floats
-                    result_data.append({
+                    # Store result
+                    sector_results.append({
                         'sector_code': sector_code,
-                        'sector_name': sector_name,
-                        'index_value': float(current_index),
-                        'sector_return': float(total_sector_return * 100),  # Convert to percentage
-                        'calculation_timestamp': current_timestamp
+                        'sector_name': sector_info['name'],
+                        'timestamp': current_timestamp,
+                        'previous_index': previous_index,
+                        'current_index': current_index,
+                        'total_return': total_sector_return,
+                        'num_companies': len(company_returns)
                     })
-                else:
-                    # Sector not in previous data, use base value
-                    current_index = self.sector_indices.get(sector_code, self.base_index_value)
-                    result_data.append({
-                        'sector_code': sector_code,
-                        'sector_name': sector_name,
-                        'index_value': float(current_index),
-                        'sector_return': 0.0,
-                        'calculation_timestamp': current_timestamp
-                    })
-            else:
-                # For the first calculation against the base
-                current_index = self.sector_indices.get(sector_code, self.base_index_value)
-                result_data.append({
-                    'sector_code': sector_code,
-                    'sector_name': sector_name,
-                    'index_value': float(current_index),
-                    'sector_return': 0.0,  # No return for base timestamp
-                    'calculation_timestamp': current_timestamp
-                })
-        
-        return pd.DataFrame(result_data)
-    
-    def save_indices_to_db(self, indices_df):
-        """Save the calculated indices to the database"""
-        try:
-            if indices_df.empty:
-                logger.warning("No indices to save to database")
-                return
+                except Exception as e:
+                    logger.error(f"Error calculating index for sector {sector_code}: {str(e)}")
             
-            # Convert numeric columns to float to avoid any Decimal issues
-            indices_df['index_value'] = indices_df['index_value'].astype(float)
-            indices_df['sector_return'] = indices_df['sector_return'].astype(float)
+            results_df = pd.DataFrame(sector_results)
             
-            # Insert data using parameterized queries for safety
-            with self.engine.connect() as connection:
-                for _, record in indices_df.iterrows():
-                    insert_query = text("""
-                    INSERT INTO sector_indices 
-                    (sector_code, sector_name, index_value, sector_return, calculation_timestamp)
-                    VALUES (:sector_code, :sector_name, :index_value, :sector_return, :calculation_timestamp)
-                    """)
-                    
-                    connection.execute(insert_query, {
-                        'sector_code': record['sector_code'],
-                        'sector_name': record['sector_name'],
-                        'index_value': float(record['index_value']),
-                        'sector_return': float(record['sector_return']),
-                        'calculation_timestamp': record['calculation_timestamp']
-                    })
-                connection.commit()
-                
-            logger.info(f"Saved {len(indices_df)} sector indices to database")
+            # Store results to database
+            if not results_df.empty:
+                self.store_results(results_df)
+            
+            return results_df
         except Exception as e:
-            logger.error(f"Error saving indices to database: {str(e)}")
+            logger.exception(f"Error in index calculation: {str(e)}")
+            return pd.DataFrame()
     
-    def calculate_indices(self):
-        """
-        Main function to calculate the sector indices
-        """
+    def store_results(self, results: pd.DataFrame) -> None:
+        """Store calculated index results to database"""
         try:
-            start_time = time.time()
-            logger.info("Starting sector index calculation...")
-            
-            # Get the latest data
-            price_df, company_info_df = self.get_latest_data() 
-            
-            if price_df.empty or company_info_df.empty:
-                logger.warning("No data available for processing")
+            # Verify DB connection before proceeding
+            if not self.db.verify_connection():
+                logger.error("Database connection failed during results storage")
                 return
             
-            # Prepare complete price data to ensure all 656 companies at each timestamp
-            complete_price_df = self.prepare_complete_price_data(price_df, company_info_df)
+            # Use batch insert for better performance
+            insert_queries = []
+            index_table_name = "Sector_Index_Values"
             
-            # Group the price data by timestamp to process each timestamp separately
-            timestamps = complete_price_df['timestamp'].unique()
-            previous_processed_data = None
-            
-            for timestamp in sorted(timestamps):
-                # Get data for current timestamp
-                current_timestamp_data = complete_price_df[complete_price_df['timestamp'] == timestamp]
+            for _, row in results.iterrows():
+                # Sanitize inputs to prevent SQL injection
+                sector_code = row['sector_code'].replace("'", "''")
+                sector_name = row['sector_name'].replace("'", "''")
+                timestamp = row['timestamp']
+                current_index = row['current_index']
+                total_return = row['total_return']
+                num_companies = row['num_companies']
                 
-                # Merge with company and sector info
-                merged_data = pd.merge(
-                    current_timestamp_data,
-                    company_info_df,
-                    on='symbol',
-                    how='inner'
+                insert_query = f"""
+                INSERT INTO {index_table_name} (sector_code, sector_name, timestamp, index_value, total_return, num_companies)
+                VALUES (
+                    '{sector_code}',
+                    '{sector_name}',
+                    '{timestamp}',
+                    {current_index},
+                    {total_return},
+                    {num_companies}
                 )
-                
-                if merged_data.empty:
-                    logger.warning(f"No matching data for timestamp {timestamp}")
-                    continue
+                """
+                insert_queries.append(insert_query)
             
-                # merged_data.to_csv("merged_data.csv", index=False)
-
-                # Perform calculations steps 1-4
-                merged_data = self.calculate_market_cap(merged_data)
-                merged_data = self.calculate_free_float(merged_data)
-                merged_data = self.calculate_free_float_mcap(merged_data)
-                merged_data = self.calculate_sector_weights(merged_data)
-                
-                # Process the timestamp data (steps 5-8)
-                indices_df = self.process_timestamp_data(merged_data, previous_processed_data)
-                # indices_df.to_csv("indices_df.csv", index=False)
-                # Save the indices to the database
-                self.save_indices_to_db(indices_df)
-                
-                # Update previous data for the next iteration
-                previous_processed_data = merged_data.copy()
+            # Execute all inserts in a single transaction
+            success = self.db.execute_transaction(insert_queries)
             
-            elapsed_time = time.time() - start_time
-            logger.info(f"Sector index calculation completed in {elapsed_time:.2f} seconds")
-            
+            if success:
+                logger.info(f"Stored {len(results)} sector index values")
+            else:
+                logger.error("Failed to store sector index values")
         except Exception as e:
-            logger.error(f"Error in sector index calculation: {str(e)}")
+            logger.exception(f"Error storing results: {str(e)}")
+
+class MarketIndexService:
+    """Main service class that orchestrates the index calculation pipeline"""
     
-    def run_scheduler(self):
-        """Run the calculator on a schedule"""
-        # Schedule to run every 10 seconds
-        schedule.every(10).seconds.do(self.calculate_indices)
+    def __init__(self, db_config: Dict[str, str], 
+                 trading_start_time: datetime.time = datetime.time(10, 30),
+                 trading_end_time: datetime.time = datetime.time(16, 30),
+                 weekend_days: List[int] = [5, 6]):  # Default 5=Saturday, 6=Sunday
+        self.db_connector = DatabaseConnector(db_config)
+        self.index_calculator = SectorIndexCalculator(self.db_connector)
+        self.trading_day_processed = False
+        self.trading_day_date = datetime.datetime.now().date()
         
+        # Configurable trading parameters
+        self.trading_start_time = trading_start_time
+        self.trading_end_time = trading_end_time
+        self.weekend_days = weekend_days
+        self.end_window_minutes = 10  # Minutes after trading end to process EOD data  # Minutes after trading end to process EOD data
+        
+    def is_trading_hours(self) -> bool:
+        """Check if current time is within trading hours"""
+        now = datetime.datetime.now()
+        current_date = now.date()
+        weekday = now.weekday()
+        
+        # Check if weekend
+        if weekday in self.weekend_days:
+            return False
+            
+        # Reset the day tracking if we're on a new day
+        if current_date != self.trading_day_date:
+            self.trading_day_date = current_date
+            self.trading_day_processed = False
+            
+        return self.trading_start_time <= now.time() <= self.trading_end_time
+    
+    def is_day_end(self) -> bool:
+        """Check if we're at the end of trading day but haven't processed EOD data yet"""
+        now = datetime.datetime.now()
+        
+        # Calculate end window time
+        end_minutes = self.trading_end_time.hour * 60 + self.trading_end_time.minute
+        window_minutes = end_minutes + self.end_window_minutes
+        window_hour = window_minutes // 60
+        window_minute = window_minutes % 60
+        end_window = datetime.time(window_hour, window_minute)
+        
+        return (self.trading_end_time < now.time() <= end_window) and not self.trading_day_processed
+        
+    def save_daily_index_data(self) -> None:
+        """Call stored procedure to save end-of-day index values"""
+        try:
+            logger.info("Calling stored procedure to save daily index data")
+
+            # Execute stored procedure
+            query = "EXEC sector_index.save_daily_index_data"
+            success = self.db_connector.execute_non_query(query)
+
+            if success:
+                logger.info("Stored daily index values via stored procedure")
+
+                # Save market cap data for next day
+                market_cap_saved = self.index_calculator.save_previous_market_cap_data()
+                if market_cap_saved:
+                    logger.info("Successfully saved market cap data for next trading day")
+
+                self.trading_day_processed = True
+            else:
+                logger.error("Failed to store daily index values via stored procedure")
+
+        except Exception as e:
+            logger.exception(f"Error saving daily index data: {str(e)}")
+
+    
+    def calculate_indices(self) -> None:
+        """Calculate indices and log results"""
+        try:
+            logger.info("Starting sector index calculation")
+            results = self.index_calculator.calculate()
+            
+            if not results.empty:
+                logger.info(f"Successfully calculated indices for {len(results)} sectors")
+                
+                # Log summary of results
+                for _, row in results.iterrows():
+                    logger.info(f"Sector {row['sector_code']}: {row['current_index']:.2f} ({row['total_return']*100:.2f}%)")
+            else:
+                logger.warning("No index results were calculated")
+        except Exception as e:
+            logger.exception(f"Error in sector index calculation: {str(e)}")
+    
+    def run(self) -> None:
+        """Run index calculation if in trading hours, or daily summary if at end of day"""
+        if self.is_trading_hours():
+            self.calculate_indices()
+        elif self.is_day_end():
+            logger.info("Trading day ended - saving daily summary")
+            self.save_daily_index_data()
+        else:
+            logger.info("Outside trading hours - skipping processing")
+    
+    def run_scheduled(self, index_interval_minutes: int = 1) -> None:
+        """Schedule execution of index calculation"""
+        logger.info(f"Scheduling index calculation every {index_interval_minutes} minute(s)")
+        
+        # Initialize previous market cap data
+        self.index_calculator.get_previous_market_cap_data()
+        
+        # Initialize sector indices from daily_index table
+        self.index_calculator.initialize_indices()
+        
+        # Run immediately once if in trading hours
+        self.run()
+        
+        # Schedule index calculation (every minute by default)
+        schedule.every(index_interval_minutes).minutes.do(self.run)
+        
+        # Run the scheduled tasks
         while True:
             schedule.run_pending()
             time.sleep(1)
-    
-    def start(self):
-        """Start the calculator in a separate thread"""
-        logger.info("Starting Sector Index Calculator...")
-        thread = threading.Thread(target=self.run_scheduler)
-        thread.daemon = True
-        thread.start()
-        return thread
-
-# Example usage
-if __name__ == "__main__":
-    # Create and start the calculator
-    calculator = SectorIndexCalculator()
-    calculator_thread = calculator.start()
-    
+# Create the previous_market_cap_data table if it doesn't exist
+def create_required_tables(db_connector):
     try:
-        # Keep the main thread alive
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        logger.info("Stopping Sector Index Calculator...")
+        logger.info("Calling stored procedure to ensure required tables exist")
+
+        query = "EXEC sector_index.create_required_tables"
+        db_connector.execute_query(query)
+
+        logger.info("Tables created or verified via stored procedure")
+        return True
+    except Exception as e:
+        logger.error(f"Error creating required tables: {str(e)}")
+        return False
+
+    
+# Get database configuration from environment variables
+def get_db_config_from_env():
+    return {
+        'server': os.getenv('DB_SERVER'),
+        'database': os.getenv('DB_NAME'),
+        'driver': '{ODBC Driver 17 for SQL Server}',
+        'username': os.getenv('DB_USERNAME'),
+        'password': os.getenv('DB_PASSWORD'),
+        'use_windows_auth': False
+    }
+
+# Main entry point
+def main():
+    # Load database configuration from environment variables
+    db_config = get_db_config_from_env()
+    
+    # Validate DB configuration
+    if not all([db_config['server'], db_config['database'], db_config['username'], db_config['password']]):
+        logger.error("Missing database configuration. Please check your .env file.")
+        logger.error(f"Server: {db_config['server']}, Database: {db_config['database']}")
+        exit(1)
+    
+    logger.info(f"Connecting to database server: {db_config['server']}, database: {db_config['database']}")
+    
+    # Create database connector for initial operations
+    db_connector = DatabaseConnector(db_config)
+    
+    # Ensure required tables exist
+    if not create_required_tables(db_connector):
+        logger.error("Failed to create required tables. Exiting.")
+        exit(1)
+    
+    # Set trading hours and weekend days (configurable)
+    trading_start = datetime.time(10, 30)  # 10:30 AM
+    trading_end = datetime.time(14, 31)    # 2:31 PM (adjust as needed)
+    weekend_days = [4, 5]                  # 5=Saturday, 4=Friday
+    
+    # Create and start the market index service with configured trading parameters
+    service = MarketIndexService(
+        db_config,
+        trading_start_time=trading_start,
+        trading_end_time=trading_end,
+        weekend_days=weekend_days
+    )
+    
+    # Run with default scheduling (indices every 1 minute)
+    service.run_scheduled()
+
+if __name__ == "__main__":
+    main()
