@@ -1,0 +1,187 @@
+
+
+
+-- CREATE SCHEMA sector_index;
+
+
+----------------------------------------------------------------------
+EXEC sector_index.sp_GetMarketCapData @timestamp = '2025-04-23 12:23:48'
+
+CREATE PROCEDURE sector_index.sp_GetMarketCapData
+    @timestamp DATETIME
+AS
+BEGIN
+    WITH Ranked AS (
+        SELECT company, LTP, ltp_dt,
+            ROW_NUMBER() OVER (PARTITION BY company ORDER BY ltp_dt DESC) AS rn
+        FROM Symbol_LTP
+        WHERE ltp_dt <= @timestamp
+    )
+    SELECT company, LTP, ltp_dt
+    FROM Ranked
+    WHERE rn = 1;
+END
+
+
+-- ------------------------
+EXEC sector_index.get_previous_market_cap_data
+
+CREATE PROCEDURE sector_index.get_previous_market_cap_data
+AS
+BEGIN
+    IF EXISTS (SELECT 1 FROM previous_market_cap_data)
+    BEGIN
+        SELECT 
+            company, 
+            ltp, 
+            timestamp, 
+            total_shares, 
+            market_cap, 
+            free_float_pct, 
+            free_float_mcap
+        FROM previous_market_cap_data;
+    END
+    ELSE
+    BEGIN
+        SELECT 
+            company, 
+            LTP AS ltp, 
+            dt AS timestamp, 
+            total_share AS total_shares, 
+            total_mcap AS market_cap, 
+            ff AS free_float_pct, 
+            ff_mcap AS free_float_mcap
+        FROM previous_history;
+    END
+END;
+
+
+--------------------------------------------------
+
+EXEC sector_index.save_daily_index_data
+
+
+
+CREATE PROCEDURE sector_index.save_daily_index_data
+AS
+BEGIN
+    DECLARE @current_date DATE = CAST(GETDATE() AS DATE);
+
+    WITH RankedStart AS (
+        SELECT sector_code, sector_name, timestamp, index_value,
+            ROW_NUMBER() OVER (PARTITION BY sector_code ORDER BY timestamp ASC) AS rn
+        FROM Sector_Index_Values
+        WHERE CAST(timestamp AS DATE) = @current_date
+    ),
+    RankedEnd AS (
+        SELECT sector_code, sector_name, timestamp, index_value,
+            ROW_NUMBER() OVER (PARTITION BY sector_code ORDER BY timestamp DESC) AS rn
+        FROM Sector_Index_Values
+        WHERE CAST(timestamp AS DATE) = @current_date
+    ),
+    StartData AS (
+        SELECT sector_code, sector_name, index_value AS start_index_value
+        FROM RankedStart WHERE rn = 1
+    ),
+    EndData AS (
+        SELECT sector_code, sector_name, index_value AS end_index_value
+        FROM RankedEnd WHERE rn = 1
+    )
+    INSERT INTO daily_index (sector_code, sector_name, date, start_index_value, end_index_value, daily_return)
+    SELECT 
+        s.sector_code,
+        s.sector_name,
+        @current_date,
+        s.start_index_value,
+        e.end_index_value,
+        CASE 
+            WHEN s.start_index_value > 0 THEN ((e.end_index_value / s.start_index_value) - 1)
+            ELSE 0 
+        END AS daily_return
+    FROM StartData s
+    JOIN EndData e
+        ON s.sector_code = e.sector_code;
+END;
+---------------------------
+
+
+CREATE PROCEDURE sector_index.create_required_tables
+AS
+BEGIN
+    -- Create table: previous_market_cap_data
+    IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'previous_market_cap_data')
+    BEGIN
+        CREATE TABLE previous_market_cap_data (
+            id INT IDENTITY(1,1) PRIMARY KEY,
+            company VARCHAR(100) NOT NULL,
+            ltp FLOAT NOT NULL,
+            timestamp DATETIME NOT NULL,
+            total_shares FLOAT NOT NULL,
+            market_cap FLOAT NOT NULL,
+            free_float_pct FLOAT NOT NULL,
+            free_float_mcap FLOAT NOT NULL,
+            created_at DATETIME DEFAULT GETDATE()
+        );
+
+        CREATE INDEX idx_prev_mcap_company ON previous_market_cap_data(company);
+    END
+
+    -- Create table: daily_index
+    IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'daily_index')
+    BEGIN
+        CREATE TABLE daily_index (
+            id INT IDENTITY(1,1) PRIMARY KEY,
+            sector_code VARCHAR(50) NOT NULL,
+            sector_name VARCHAR(100) NOT NULL,
+            date DATE NOT NULL,
+            start_index_value FLOAT NOT NULL,
+            end_index_value FLOAT NOT NULL,
+            daily_return FLOAT NOT NULL,
+            created_at DATETIME DEFAULT GETDATE()
+        );
+
+        CREATE INDEX idx_daily_index_sector ON daily_index(sector_code);
+        CREATE INDEX idx_daily_index_date ON daily_index(date);
+    END
+END;
+
+
+-----------------------------------
+
+
+CREATE PROCEDURE sector_index.GetLatestSectorIndices
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    WITH LastIndices AS (
+        SELECT 
+            sector_code, 
+            end_index_value,
+            ROW_NUMBER() OVER (PARTITION BY sector_code ORDER BY date DESC) AS rn
+        FROM daily_index
+    )
+    SELECT 
+        sector_code, 
+        end_index_value
+    FROM LastIndices
+    WHERE rn = 1;
+END;
+GO
+
+
+
+
+--------------------------------
+
+-- Symbol_LTP
+CREATE NONCLUSTERED INDEX idx_symbol_ltp_company_ltpdt 
+ON Symbol_LTP(company, ltp_dt DESC);
+
+-- previous_market_cap_data
+CREATE INDEX idx_prev_mcap_timestamp 
+ON previous_market_cap_data(timestamp);
+
+-- Sector_Index_Values
+CREATE NONCLUSTERED INDEX idx_sector_index_timestamp 
+ON Sector_Index_Values(sector_code, timestamp);
