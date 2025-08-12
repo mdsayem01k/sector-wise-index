@@ -1,0 +1,25 @@
+2025-07-25 19:35:44 - HistoricalIndexService - INFO - Logging to file: logs\HistoricalIndexService_20250725_193544.log
+2025-07-25 19:35:44 - HistoricalIndexService - INFO - No historical data found before start date. Using BASE_INDEX for all sectors.
+2025-07-25 19:37:28 - HistoricalIndexService - INFO - Historical index calculation completed with 210 data points
+2025-07-25 19:37:28 - HistoricalIndexService - INFO - Summary of historical index calculation:
+2025-07-25 19:37:28 - HistoricalIndexService - INFO - Sector 11 (Bank): Start: 100.00, End: 100.08, Return: 0.08%
+2025-07-25 19:37:28 - HistoricalIndexService - INFO - Sector 12 (Mutual Funds): Start: 100.00, End: 100.37, Return: 0.37%
+2025-07-25 19:37:28 - HistoricalIndexService - INFO - Sector 13 (Engineering): Start: 100.00, End: 101.13, Return: 1.13%
+2025-07-25 19:37:28 - HistoricalIndexService - INFO - Sector 14 (Food & Allied): Start: 100.00, End: 100.74, Return: 0.74%
+2025-07-25 19:37:28 - HistoricalIndexService - INFO - Sector 15 (Fuel & Power): Start: 100.00, End: 99.82, Return: -0.18%
+2025-07-25 19:37:28 - HistoricalIndexService - INFO - Sector 16 (Jute): Start: 100.00, End: 100.68, Return: 0.68%
+2025-07-25 19:37:28 - HistoricalIndexService - INFO - Sector 17 (Textile): Start: 100.00, End: 100.36, Return: 0.36%
+2025-07-25 19:37:28 - HistoricalIndexService - INFO - Sector 18 (Pharmaceuticals & Chemicals): Start: 100.00, End: 99.86, Return: -0.14%
+2025-07-25 19:37:28 - HistoricalIndexService - INFO - Sector 19 (Paper & Printing): Start: 100.00, End: 100.45, Return: 0.45%
+2025-07-25 19:37:28 - HistoricalIndexService - INFO - Sector 20 (Services & Real Estate): Start: 100.00, End: 100.40, Return: 0.40%
+2025-07-25 19:37:28 - HistoricalIndexService - INFO - Sector 21 (Cement): Start: 100.00, End: 99.65, Return: -0.35%
+2025-07-25 19:37:28 - HistoricalIndexService - INFO - Sector 22 (IT Sector): Start: 100.00, End: 100.05, Return: 0.05%
+2025-07-25 19:37:28 - HistoricalIndexService - INFO - Sector 23 (Tannery Industries): Start: 100.00, End: 101.01, Return: 1.01%
+2025-07-25 19:37:28 - HistoricalIndexService - INFO - Sector 24 (Ceramics Sector): Start: 100.00, End: 103.60, Return: 3.60%
+2025-07-25 19:37:28 - HistoricalIndexService - INFO - Sector 25 (Insurance): Start: 100.00, End: 99.92, Return: -0.08%
+2025-07-25 19:37:28 - HistoricalIndexService - INFO - Sector 26 (Corporate Bond): Start: 100.00, End: 99.16, Return: -0.84%
+2025-07-25 19:37:28 - HistoricalIndexService - INFO - Sector 27 (Telecommunication): Start: 100.00, End: 100.67, Return: 0.67%
+2025-07-25 19:37:28 - HistoricalIndexService - INFO - Sector 28 (Financial Institutions): Start: 100.00, End: 100.59, Return: 0.59%
+2025-07-25 19:37:28 - HistoricalIndexService - INFO - Sector 29 (Travel & Leisure): Start: 100.00, End: 100.27, Return: 0.27%
+2025-07-25 19:37:28 - HistoricalIndexService - INFO - Sector 88 (G-SEC (T.Bond)): Start: 100.00, End: 100.00, Return: 0.00%
+2025-07-25 19:37:28 - HistoricalIndexService - INFO - Sector 99 (Miscellaneous): Start: 100.00, End: 100.08, Return: 0.08%

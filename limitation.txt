@@ -1,0 +1,1 @@
+hist run date range must be within data , as every month may be change sector company ff others info change
